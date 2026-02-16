@@ -8,7 +8,28 @@ Everything else is just efficiency.
 import os       # os.path.exists
 import math     # math.log, math.exp
 import random   # random.seed, random.choices, random.gauss, random.shuffle
+import atexit
+from builtins import print as builtin_print
 random.seed(42) # Let there be order among chaos
+
+RUN_ID = "02"
+RUN_DIR = os.path.join("runs", RUN_ID)
+os.makedirs(RUN_DIR, exist_ok=True)
+log_file = open(os.path.join(RUN_DIR, "output.txt"), "w", encoding="utf-8")
+loss_csv = open(os.path.join(RUN_DIR, "loss.csv"), "w", encoding="utf-8")
+metrics_csv = open(os.path.join(RUN_DIR, "metrics.csv"), "w", encoding="utf-8")
+loss_csv.write("step,loss\n")
+metrics_csv.write("step,train_loss,val_loss,val_ppl\n")
+
+def print(*args, **kwargs):
+    builtin_print(*args, **kwargs)
+    file_kwargs = dict(kwargs)
+    file_kwargs.pop("file", None)
+    builtin_print(*args, file=log_file, **file_kwargs)
+
+atexit.register(log_file.close)
+atexit.register(loss_csv.close)
+atexit.register(metrics_csv.close)
 
 # Let there be an input dataset `docs`: list[str] of documents (e.g. a dataset of names)
 if not os.path.exists('input.txt'):
@@ -17,6 +38,9 @@ if not os.path.exists('input.txt'):
     urllib.request.urlretrieve(names_url, 'input.txt')
 docs = [l.strip() for l in open('input.txt').read().strip().split('\n') if l.strip()] # list[str] of documents
 random.shuffle(docs)
+split = int(0.9 * len(docs))
+train_docs = docs[:split]
+val_docs = docs[split:]
 print(f"num docs: {len(docs)}")
 
 # Let there be a Tokenizer to translate strings to discrete symbols and back
@@ -149,10 +173,12 @@ v = [0.0] * len(params) # second moment buffer
 
 # Repeat in sequence
 num_steps = 1000 # number of training steps
+EVAL_EVERY = 50
+VAL_EVAL_DOCS = 200
 for step in range(num_steps):
 
     # Take single document, tokenize it, surround it with BOS special token on both sides
-    doc = docs[step % len(docs)]
+    doc = train_docs[step % len(train_docs)]
     tokens = [BOS] + [uchars.index(ch) for ch in doc] + [BOS]
     n = min(block_size, len(tokens) - 1)
 
@@ -180,7 +206,26 @@ for step in range(num_steps):
         p.data -= lr_t * m_hat / (v_hat ** 0.5 + eps_adam)
         p.grad = 0
 
+    loss_csv.write(f"{step+1},{loss.data}\n")
     print(f"step {step+1:4d} / {num_steps:4d} | loss {loss.data:.4f}")
+
+    if (step + 1) % EVAL_EVERY == 0:
+        val_losses = []
+        for val_doc in val_docs[:VAL_EVAL_DOCS]:
+            tokens = [BOS] + [uchars.index(ch) for ch in val_doc] + [BOS]
+            n = min(block_size, len(tokens) - 1)
+            keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
+            losses = []
+            for pos_id in range(n):
+                token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
+                logits = gpt(token_id, pos_id, keys, values)
+                probs = softmax(logits)
+                loss_t = -probs[target_id].log()
+                losses.append(loss_t)
+            val_losses.append(((1 / n) * sum(losses)).data)
+        val_loss = sum(val_losses) / len(val_losses)
+        val_ppl = math.exp(val_loss)
+        metrics_csv.write(f"{step+1},{loss.data},{val_loss},{val_ppl}\n")
 
 # Inference: may the model babble back to us
 temperature = 0.5 # in (0, 1], control the "creativity" of generated text, low to high
